@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- Activity-bar icons are used as a mask, so only the alpha channel matters:
+       the colour here is a placeholder that VS Code replaces with the theme's. -->
+  <path d="M12 2.6 21.2 7.3v9.4L12 21.4 2.8 16.7V7.3Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+  <path d="M2.8 7.3 12 12l9.2-4.7M12 12v9.4" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+  <rect x="9.4" y="9.4" width="5.2" height="5.2" rx="1" fill="currentColor" opacity="0.85"/>
+</svg>

@@ -1,0 +1,344 @@
+{
+  "name": "roblox-explorer-link",
+  "displayName": "Roblox Explorer Link",
+  "description": "Mirrors a live Roblox Studio Explorer tree \u2014 icons, properties, a 3D preview, and script source \u2014 into VS Code, and opens Script Sync's files straight from the tree.",
+  "version": "1.2.1",
+  "license": "MIT",
+  "publisher": "explorer-link",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "roblox",
+    "roblox studio",
+    "luau",
+    "explorer",
+    "datamodel",
+    "script sync",
+    "3d preview"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "explorerLink",
+          "title": "Roblox Explorer",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "explorerLink": [
+        {
+          "id": "explorerLink.tree",
+          "name": "Explorer",
+          "icon": "media/activity.svg"
+        },
+        {
+          "id": "explorerLink.properties",
+          "name": "Properties"
+        },
+        {
+          "id": "explorerLink.preview",
+          "name": "3D Preview",
+          "type": "webview"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "explorerLink.tree",
+        "contents": "No Studio session is linked yet.\n\nInstall the Explorer Link plugin in Roblox Studio, open its panel, and paste the pairing token.\n\n[Show pairing token](command:explorerLink.showToken)\n[Open setup guide](command:explorerLink.openWalkthrough)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "explorerLink.showToken",
+        "title": "Show Pairing Token",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.refresh",
+        "title": "Refresh Tree",
+        "category": "Explorer Link",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "explorerLink.revealInStudio",
+        "title": "Reveal in Studio",
+        "category": "Explorer Link",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "explorerLink.openScript",
+        "title": "Open Script",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.copyPath",
+        "title": "Copy Path",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.goToPath",
+        "title": "Go to Path\u2026",
+        "category": "Explorer Link",
+        "icon": "$(search)"
+      },
+      {
+        "command": "explorerLink.restartServer",
+        "title": "Restart Link Server",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.openWalkthrough",
+        "title": "Setup Guide",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.openReadOnly",
+        "title": "Open Read-only Copy from Studio",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.revealFile",
+        "title": "Reveal Synced File in Explorer",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.rescanSyncedFiles",
+        "title": "Rescan for Synced Files",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.setUpGit",
+        "title": "Set Up Git in Sync Folder",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.refreshPreview",
+        "title": "Refresh 3D Preview",
+        "category": "Explorer Link",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "explorerLink.copyPropertyValue",
+        "title": "Copy Value",
+        "category": "Explorer Link",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "explorerLink.copyPropertyName",
+        "title": "Copy Property Name",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.copyPropertyPair",
+        "title": "Copy as Name = Value",
+        "category": "Explorer Link"
+      },
+      {
+        "command": "explorerLink.copyAllProperties",
+        "title": "Copy All Properties",
+        "category": "Explorer Link",
+        "icon": "$(clippy)"
+      },
+      {
+        "command": "explorerLink.openPreviewInEditor",
+        "title": "Open 3D Preview in Editor",
+        "category": "Explorer Link",
+        "icon": "$(split-horizontal)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "explorerLink.goToPath",
+          "when": "view == explorerLink.tree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "explorerLink.refresh",
+          "when": "view == explorerLink.tree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "explorerLink.copyAllProperties",
+          "when": "view == explorerLink.properties",
+          "group": "navigation@1"
+        },
+        {
+          "command": "explorerLink.refreshPreview",
+          "when": "view == explorerLink.preview",
+          "group": "navigation@1"
+        },
+        {
+          "command": "explorerLink.openPreviewInEditor",
+          "when": "view == explorerLink.tree",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "explorerLink.revealInStudio",
+          "when": "view == explorerLink.tree",
+          "group": "inline"
+        },
+        {
+          "command": "explorerLink.openScript",
+          "when": "view == explorerLink.tree && viewItem =~ /script/",
+          "group": "1_open"
+        },
+        {
+          "command": "explorerLink.copyPath",
+          "when": "view == explorerLink.tree",
+          "group": "2_copy"
+        },
+        {
+          "command": "explorerLink.revealFile",
+          "when": "view == explorerLink.tree && viewItem =~ /synced/",
+          "group": "1_open"
+        },
+        {
+          "command": "explorerLink.openReadOnly",
+          "when": "view == explorerLink.tree && viewItem =~ /script/",
+          "group": "1_open"
+        },
+        {
+          "command": "explorerLink.copyPropertyValue",
+          "when": "view == explorerLink.properties && viewItem == propertyRow",
+          "group": "inline"
+        },
+        {
+          "command": "explorerLink.copyPropertyValue",
+          "when": "view == explorerLink.properties && viewItem == propertyRow",
+          "group": "1_copy@1"
+        },
+        {
+          "command": "explorerLink.copyPropertyName",
+          "when": "view == explorerLink.properties && viewItem == propertyRow",
+          "group": "1_copy@2"
+        },
+        {
+          "command": "explorerLink.copyPropertyPair",
+          "when": "view == explorerLink.properties && viewItem == propertyRow",
+          "group": "1_copy@3"
+        },
+        {
+          "command": "explorerLink.copyPropertyValue",
+          "when": "view == explorerLink.properties && viewItem == propertyGroup",
+          "group": "1_copy@1"
+        },
+        {
+          "command": "explorerLink.openPreviewInEditor",
+          "when": "view == explorerLink.tree",
+          "group": "3_view"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "explorerLink.openScript",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.copyPath",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.revealInStudio",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.openReadOnly",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.revealFile",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.copyPropertyValue",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.copyPropertyName",
+          "when": "false"
+        },
+        {
+          "command": "explorerLink.copyPropertyPair",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Roblox Explorer Link",
+      "properties": {
+        "explorerLink.port": {
+          "type": "number",
+          "default": 34873,
+          "minimum": 1024,
+          "maximum": 65535,
+          "markdownDescription": "Local port the link server listens on. Must match the port set in the Studio plugin panel. Ports below 1024 are blocked for Studio plugin requests."
+        },
+        "explorerLink.preferDiskFiles": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When a script has a file on disk from Roblox's [Script Sync](https://create.roblox.com/docs/scripting/sync), open that editable file instead of the read-only copy from Studio. Turn off to always use the read-only view."
+        },
+        "explorerLink.showClassNames": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show each instance's ClassName next to its name, the way Studio's Explorer does."
+        },
+        "explorerLink.followStudioSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal and select a node here when it is selected in Studio."
+        },
+        "explorerLink.syncSelectionToStudio": {
+          "type": "boolean",
+          "default": true,
+          "description": "Select the matching instance in Studio when a node is clicked here."
+        },
+        "explorerLink.openScriptOnClick": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open a script's source in an editor tab on a single click, rather than requiring the context menu."
+        },
+        "explorerLink.holdMs": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 2000,
+          "maximum": 55000,
+          "description": "How long the server holds a poll open when it has nothing to send. Lower values cost more requests against Studio's HTTP budget."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "icons": "python3 ../tools/gen_icons.py --out media",
+    "package": "npx --yes @vscode/vsce package --no-dependencies",
+    "test": "node test/icons.test.js && node test/syncmap.test.js && node test/preview.test.js && node test/fake-studio.js",
+    "check-lua": "python3 ../tools/check_lua.py ../plugin/src"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-name/roblox-explorer-link"
+  }
+}

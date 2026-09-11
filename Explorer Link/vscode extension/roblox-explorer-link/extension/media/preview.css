@@ -1,0 +1,129 @@
+/* The preview view: a canvas that fills the panel, with a thin status strip on top. */
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  background: var(--vscode-editor-background);
+}
+
+#wrap {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 6px 8px;
+  /* A sidebar panel can be 250px wide; let the strip wrap rather than truncate the
+     instance's name down to an ellipsis. */
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  min-height: 24px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+
+#heading {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* The name is the one thing worth keeping legible, so it shrinks last. */
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+
+#detail {
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 60px;
+  min-width: 0;
+  font-size: 0.92em;
+}
+
+#badge {
+  /* Shrinkable: at 250px the buttons and the instance name matter more than the full
+     approximation label, which the tooltip repeats anyway. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 6px;
+  border-radius: 9px;
+  font-size: 0.82em;
+  white-space: nowrap;
+  color: var(--vscode-editor-background);
+  background: var(--vscode-charts-orange, #d18616);
+}
+
+.actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+button {
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 0.9em;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  background: var(--vscode-button-secondaryBackground, transparent);
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+#stage {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+}
+
+#stage:active {
+  cursor: grabbing;
+}
+
+#empty {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 20px;
+  text-align: center;
+  color: var(--vscode-descriptionForeground);
+  line-height: 1.5;
+}
+
+#hint {
+  position: absolute;
+  left: 8px;
+  bottom: 6px;
+  font-size: 0.82em;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+[hidden] {
+  display: none !important;
+}

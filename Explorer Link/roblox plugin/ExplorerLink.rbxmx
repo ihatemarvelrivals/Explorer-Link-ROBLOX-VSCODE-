@@ -1,0 +1,2382 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Item class="Script" referent="RBX0">
+		<Properties>
+			<string name="Name">ExplorerLink</string>
+			<ProtectedString name="Source"><![CDATA[--[[
+	Explorer Link — Roblox Studio side.
+
+	Mirrors this place's Explorer into VS Code: the tree, class icons, properties, and
+	read-only script source. VS Code hosts the HTTP server; this plugin is the client
+	and drives every exchange, because Luau has no WebSocket client and cannot listen
+	for inbound connections.
+
+	Nothing here writes to the DataModel. The only side effects are Selection changes
+	and opening a script tab, both of them things the user explicitly asked for from
+	the VS Code side.
+
+	Repo: https://github.com/<you>/roblox-explorer-link
+]]
+
+local RunService = game:GetService("RunService")
+
+local Config = require(script.Config)
+local Log = require(script.Log)
+local Registry = require(script.Registry)
+local Transport = require(script.Transport)
+local Ui = require(script.Ui)
+local Watcher = require(script.Watcher)
+
+-- Studio runs plugin scripts in edit mode and again inside a play-test session. Only
+-- the edit-mode copy should hold the link, otherwise pressing Play spawns a second
+-- client that fights the first one for the same session id.
+if not RunService:IsEdit() then
+	return
+end
+
+local toolbar = plugin:CreateToolbar("Explorer Link")
+local ui = Ui.new(plugin, toolbar)
+
+local transport
+local watcher = Watcher.new(function(event)
+	if transport then
+		Transport.emit(transport, event)
+	end
+end)
+
+transport = Transport.new(plugin, watcher)
+transport.onStatus = function(status, message)
+	Ui.setStatus(ui, status, message)
+end
+
+ui.onReconnect = function()
+	Transport.reconnect(transport)
+end
+
+Watcher.startSelectionMirror(watcher)
+Transport.start(transport)
+
+-- Saving under a different name, or opening another place, invalidates every ref VS
+-- Code holds. Cheaper to make it re-handshake than to try to remap.
+local placeConnection = game:GetPropertyChangedSignal("PlaceId"):Connect(function()
+	Log.info("place changed; resetting link")
+	Registry.clear()
+	Watcher.destroy(watcher)
+	Watcher.startSelectionMirror(watcher)
+	Transport.reconnect(transport)
+end)
+
+plugin.Unloading:Connect(function()
+	placeConnection:Disconnect()
+	Transport.stop(transport, "plugin-unloading")
+	Watcher.destroy(watcher)
+	Ui.destroy(ui)
+	Registry.clear()
+end)
+
+Log.info(string.format("v%s ready — waiting for VS Code on port %d", Config.VERSION, Config.get(plugin).port))
+]]></ProtectedString>
+		</Properties>
+		<Item class="ModuleScript" referent="RBX2">
+			<Properties>
+				<string name="Name">ClassTags</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		ClassTags — a curated ancestry, most specific first.
+
+		The extension picks an icon by exact ClassName, then walks these tags in order, then
+		falls back to a generic instance icon. That means a class Roblox ships next month
+		still lands on a sensible icon without shipping or fetching an API dump, and the
+		extension never needs to know the full class hierarchy.
+
+		Order matters: the list is walked top to bottom and the first IsA match wins, so
+		narrow classes must come before the base classes they inherit from.
+]]
+
+local ClassTags = {}
+
+local ORDERED: { string } = {
+		-- Scripts first: they are what people are here for.
+		"ModuleScript",
+		"LocalScript",
+		"Script",
+		"BaseScript",
+		"LuaSourceContainer",
+
+		-- Parts and geometry.
+		"MeshPart",
+		"UnionOperation",
+		"Terrain",
+		"WedgePart",
+		"CornerWedgePart",
+		"TrussPart",
+		"SpawnLocation",
+		"Seat",
+		"VehicleSeat",
+		"Part",
+		"BasePart",
+		"Model",
+		"Tool",
+		"Accessory",
+		"Folder",
+		"Configuration",
+
+		-- UI.
+		"ScreenGui",
+		"SurfaceGui",
+		"BillboardGui",
+		"TextButton",
+		"ImageButton",
+		"TextLabel",
+		"TextBox",
+		"ImageLabel",
+		"ScrollingFrame",
+		"CanvasGroup",
+		"VideoFrame",
+		"ViewportFrame",
+		"Frame",
+		"UIGridLayout",
+		"UIListLayout",
+		"UIPadding",
+		"UICorner",
+		"UIStroke",
+		"UIGradient",
+		"UIScale",
+		"UIAspectRatioConstraint",
+		"UIComponent",
+		"GuiButton",
+		"GuiLabel",
+		"GuiObject",
+		"LayerCollector",
+		"GuiBase",
+
+		-- Networking and data.
+		"RemoteEvent",
+		"UnreliableRemoteEvent",
+		"RemoteFunction",
+		"BindableEvent",
+		"BindableFunction",
+
+		-- Values.
+		"StringValue",
+		"IntValue",
+		"NumberValue",
+		"BoolValue",
+		"ObjectValue",
+		"CFrameValue",
+		"Vector3Value",
+		"Color3Value",
+		"BrickColorValue",
+		"RayValue",
+		"ValueBase",
+
+		-- Physics, joints, constraints.
+		"Motor6D",
+		"Weld",
+		"WeldConstraint",
+		"Attachment",
+		"Constraint",
+		"JointInstance",
+		"BodyMover",
+		"Humanoid",
+		"HumanoidDescription",
+		"Animator",
+		"Animation",
+		"AnimationController",
+
+		-- Effects and audio.
+		"ParticleEmitter",
+		"Beam",
+		"Trail",
+		"Explosion",
+		"Fire",
+		"Smoke",
+		"Sparkles",
+		"Highlight",
+		"SelectionBox",
+		"Sound",
+		"SoundGroup",
+		"SoundEffect",
+		"PointLight",
+		"SpotLight",
+		"SurfaceLight",
+		"Light",
+		"Decal",
+		"Texture",
+		"SurfaceAppearance",
+		"Atmosphere",
+		"Sky",
+		"PostEffect",
+
+		-- Misc containers and behaviour.
+		"Camera",
+		"Player",
+		"Team",
+		"ClickDetector",
+		"ProximityPrompt",
+		"TouchTransmitter",
+		"Mesh",
+		"CollectionService",
+		"Script",
+}
+
+--- Builds the tag list for an instance. Always ends with the exact ClassName at the
+--- front and "Instance" at the back, so the extension has a guaranteed first and last
+--- resort.
+function ClassTags.forInstance(instance: Instance): { string }
+		local tags: { string } = { instance.ClassName }
+		local seen: { [string]: boolean } = { [instance.ClassName] = true }
+
+		for _, className in ipairs(ORDERED) do
+			if not seen[className] then
+				local ok, isA = pcall(function()
+					return instance:IsA(className)
+				end)
+				if ok and isA then
+					tags[#tags + 1] = className
+					seen[className] = true
+				end
+			end
+		end
+
+		tags[#tags + 1] = "Instance"
+		return tags
+end
+
+ClassTags.ORDERED = ORDERED
+
+return ClassTags
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX3">
+			<Properties>
+				<string name="Name">Commands</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Commands — one handler per command type in PROTOCOL.md.
+
+		Handlers return a plain table on success or `error("message")` on failure; the
+		transport wraps whichever happens into a `result` event carrying the command id.
+]]
+
+local Log = require(script.Parent.Log)
+local PropertySpecs = require(script.Parent.PropertySpecs)
+local Registry = require(script.Parent.Registry)
+local Serializer = require(script.Parent.Serializer)
+local Watcher = require(script.Parent.Watcher)
+
+local Commands = {}
+
+--[[
+		The services Studio's Explorer shows at the top level, in its order. `FindService`
+		rather than `GetService` throughout, so opening the tree never has the side effect
+		of creating a service that was not already in the place.
+]]
+local ROOT_SERVICES = {
+		"Workspace",
+		"Players",
+		"Lighting",
+		"MaterialService",
+		"ReplicatedFirst",
+		"ReplicatedStorage",
+		"ServerScriptService",
+		"ServerStorage",
+		"StarterGui",
+		"StarterPack",
+		"StarterPlayer",
+		"Teams",
+		"SoundService",
+		"TextChatService",
+		"Chat",
+		"LocalizationService",
+		"TestService",
+}
+
+--- The root row set: curated services, plus any other service that already holds
+--- children so nothing in the place is invisible.
+function Commands.roots(): { { [string]: any } }
+		local nodes = {}
+		local included: { [Instance]: boolean } = {}
+
+		for _, name in ipairs(ROOT_SERVICES) do
+			local ok, service = pcall(function()
+				return game:FindService(name)
+			end)
+			if ok and service then
+				included[service] = true
+				local okNode, node = pcall(Serializer.node, service)
+				if okNode then
+					nodes[#nodes + 1] = node
+				end
+			end
+		end
+
+		for _, child in ipairs(game:GetChildren()) do
+			if not included[child] then
+				local okCount, children = pcall(function()
+					return child:GetChildren()
+				end)
+				if okCount and #children > 0 then
+					local okNode, node = pcall(Serializer.node, child)
+					if okNode then
+						nodes[#nodes + 1] = node
+					end
+				end
+			end
+		end
+
+		return nodes
+end
+
+local function requireInstance(ref: string): Instance
+		local instance = Registry.resolve(ref)
+		if not instance then
+			error("stale-ref", 0)
+		end
+		return instance
+end
+
+export type Context = {
+		watcher: Watcher.Watcher,
+		pluginRef: Plugin,
+}
+
+local handlers: { [string]: (Context, { [string]: any }) -> { [string]: any } } = {}
+
+handlers.ping = function(_context, _payload)
+		return { t = os.clock() }
+end
+
+handlers.getChildren = function(context, payload)
+		local instance = requireInstance(payload.ref)
+		-- Expanding a node is exactly when watching it starts paying for itself.
+		Watcher.subscribe(context.watcher, payload.ref, instance)
+		return { nodes = Serializer.children(instance) }
+end
+
+handlers.getProperties = function(_context, payload)
+		local instance = requireInstance(payload.ref)
+		return { groups = PropertySpecs.groupsFor(instance) }
+end
+
+handlers.getSource = function(context, payload)
+		local instance = requireInstance(payload.ref)
+		if not instance:IsA("LuaSourceContainer") then
+			error("not-a-script", 0)
+		end
+
+		-- Roblox decoupled `Source` from the script editor: while a script is open in
+		-- Studio, `Source` only catches up periodically, so reading it directly can hand
+		-- back text the user edited minutes ago. GetEditorSource is the current view.
+		-- It is newer than some Studio builds, hence the fall back.
+		local source: string? = nil
+		local okEditor, editorSource = pcall(function()
+			return game:GetService("ScriptEditorService"):GetEditorSource(instance)
+		end)
+		if okEditor and type(editorSource) == "string" then
+			source = editorSource
+		else
+			local okSource, rawSource = pcall(function()
+				return (instance :: any).Source
+			end)
+			if not okSource then
+				-- Inaccessible for scripts inside a locked or protected model.
+				error("source-unavailable", 0)
+			end
+			source = rawSource
+		end
+
+		Watcher.watchSource(context.watcher, payload.ref, instance)
+		return {
+			source = source,
+			name = instance.Name,
+			className = instance.ClassName,
+			path = Serializer.fullPath(instance),
+		}
+end
+
+handlers.releaseSource = function(context, payload)
+		Watcher.unwatchSource(context.watcher, payload.ref)
+		return {}
+end
+
+handlers.subscribe = function(context, payload)
+		for _, ref in ipairs(payload.refs or {}) do
+			local instance = Registry.resolve(ref)
+			if instance then
+				Watcher.subscribe(context.watcher, ref, instance)
+			end
+		end
+		return {}
+end
+
+handlers.unsubscribe = function(context, payload)
+		for _, ref in ipairs(payload.refs or {}) do
+			Watcher.unsubscribe(context.watcher, ref)
+		end
+		return {}
+end
+
+handlers.select = function(context, payload)
+		local instances = {}
+		for _, ref in ipairs(payload.refs or {}) do
+			local instance = Registry.resolve(ref)
+			if instance then
+				instances[#instances + 1] = instance
+			end
+		end
+		Watcher.applySelection(context.watcher, instances)
+		return {}
+end
+
+handlers.revealInStudio = function(context, payload)
+		local instance = requireInstance(payload.ref)
+		Watcher.applySelection(context.watcher, { instance })
+		-- Opening a script also brings its Studio editor tab forward, which is the closest
+		-- thing the plugin API has to "scroll the Explorer to this row".
+		if instance:IsA("LuaSourceContainer") then
+			pcall(function()
+				context.pluginRef:OpenScript(instance)
+			end)
+		end
+		return {}
+end
+
+--- Resolves "game.Workspace.Sword.Handle" to a ref, so VS Code can restore an expanded
+--- tree across a reconnect without holding stale refs.
+handlers.resolvePath = function(_context, payload)
+		local path = tostring(payload.path or "")
+		local current: Instance? = game
+		local first = true
+		for segment in string.gmatch(path, "[^%.]+") do
+			if first and segment == "game" then
+				first = false
+			else
+				first = false
+				if not current then
+					return { ref = nil }
+				end
+				local ok, found = pcall(function()
+					return (current :: Instance):FindFirstChild(segment)
+				end)
+				if not ok or not found then
+					return { ref = nil }
+				end
+				current = found
+			end
+		end
+		if not current then
+			return { ref = nil }
+		end
+		return { ref = Registry.refFor(current) }
+end
+
+--[[
+		Geometry for the 3D preview.
+
+		Only primitive shape, size, position and orientation travel — a plugin cannot read
+		the vertices behind a MeshPart or a union (MeshId is an asset reference, not data),
+		so those report as boxes and are counted so the viewer can say so out loud rather
+		than quietly drawing a lie.
+]]
+local SHAPE_BY_PART_TYPE: { [Enum.PartType]: string } = {
+		[Enum.PartType.Ball] = "ball",
+		[Enum.PartType.Cylinder] = "cylinder",
+		[Enum.PartType.Block] = "box",
+}
+
+local function shapeOf(part: BasePart): (string, boolean)
+		-- Order matters: MeshPart and the union operations are BaseParts too.
+		if part:IsA("MeshPart") or part:IsA("UnionOperation") or part:IsA("TrussPart") then
+			return "box", true
+		end
+		if part:IsA("WedgePart") then
+			return "wedge", false
+		end
+		if part:IsA("CornerWedgePart") then
+			return "cornerwedge", false
+		end
+		if part:IsA("Part") then
+			local okShape, partType = pcall(function()
+				return (part :: Part).Shape
+			end)
+			if okShape then
+				local named = SHAPE_BY_PART_TYPE[partType]
+				if named then
+					return named, false
+				end
+				-- Wedge and CornerWedge exist on PartType in newer builds; compare by name so
+				-- an older Studio without those enum members does not error on lookup.
+				local asName = tostring(partType):gsub("^Enum%.PartType%.", "")
+				if asName == "Wedge" then
+					return "wedge", false
+				end
+				if asName == "CornerWedge" then
+					return "cornerwedge", false
+				end
+			end
+			return "box", false
+		end
+		return "box", true
+end
+
+local function round3(n: number): number
+		if n ~= n or n == math.huge or n == -math.huge then
+			return 0
+		end
+		return math.floor(n * 1000 + 0.5) / 1000
+end
+
+handlers.getGeometry = function(_context, payload)
+		local instance = requireInstance(payload.ref)
+		local maxParts = math.clamp(tonumber(payload.maxParts) or 400, 1, 2000)
+
+		local parts = {}
+		local approximated = 0
+		local visited = 0
+		local truncated = false
+
+		local function add(part: BasePart)
+			local shape, isApproximate = shapeOf(part)
+			if isApproximate then
+				approximated += 1
+			end
+
+			local size = part.Size
+			local cf = part.CFrame
+			local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+			local color = part.Color
+
+			parts[#parts + 1] = {
+				name = part.Name,
+				className = part.ClassName,
+				shape = shape,
+				approximate = isApproximate,
+				size = { round3(size.X), round3(size.Y), round3(size.Z) },
+				-- position first, then the rotation matrix row by row, exactly as
+				-- CFrame:GetComponents orders them.
+				cframe = {
+					round3(x),
+					round3(y),
+					round3(z),
+					round3(r00),
+					round3(r01),
+					round3(r02),
+					round3(r10),
+					round3(r11),
+					round3(r12),
+					round3(r20),
+					round3(r21),
+					round3(r22),
+				},
+				color = { round3(color.R), round3(color.G), round3(color.B) },
+				transparency = round3(part.Transparency),
+				material = tostring(part.Material):gsub("^Enum%.Material%.", ""),
+			}
+		end
+
+		-- Iterative walk with a visit budget: GetDescendants on a large model allocates the
+		-- whole list up front, and a preview never needs more than the first few hundred.
+		local stack: { Instance } = { instance }
+		while #stack > 0 do
+			local current = table.remove(stack) :: Instance
+			visited += 1
+			if visited > 25000 then
+				truncated = true
+				break
+			end
+
+			if current:IsA("BasePart") then
+				local ok = pcall(add, current)
+				if ok and #parts >= maxParts then
+					truncated = true
+					break
+				end
+			end
+
+			local okChildren, children = pcall(function()
+				return current:GetChildren()
+			end)
+			if okChildren then
+				for _, child in ipairs(children) do
+					stack[#stack + 1] = child
+				end
+			end
+		end
+
+		return {
+			name = instance.Name,
+			className = instance.ClassName,
+			path = Serializer.fullPath(instance),
+			parts = parts,
+			approximated = approximated,
+			truncated = truncated,
+			maxParts = maxParts,
+		}
+end
+
+handlers.stats = function(context, _payload)
+		return {
+			refs = Registry.size(),
+			subscriptions = Watcher.subscriptionCount(context.watcher),
+		}
+end
+
+--- Runs a command, converting any error into a failed result event.
+function Commands.dispatch(context: Context, command: { [string]: any }): { [string]: any }
+		local handler = handlers[command.type]
+		if not handler then
+			return { type = "result", id = command.id, ok = false, error = "unknown-command:" .. tostring(command.type) }
+		end
+
+		local ok, result = pcall(handler, context, command)
+		if not ok then
+			Log.debug("command failed:", command.type, result)
+			return { type = "result", id = command.id, ok = false, error = tostring(result) }
+		end
+		return { type = "result", id = command.id, ok = true, data = result }
+end
+
+Commands.ROOT_SERVICES = ROOT_SERVICES
+
+return Commands
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX4">
+			<Properties>
+				<string name="Name">Config</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Config — user-tweakable settings, persisted through plugin:SetSetting.
+
+		Everything the plugin needs to reach VS Code lives here. The defaults match the
+		extension's defaults, so a fresh install of both sides connects with no setup.
+]]
+
+local Config = {}
+
+Config.PROTOCOL = 1
+Config.VERSION = "1.0.0"
+
+-- Studio's trust check rejects the literal 127.0.0.1 for plugin requests, so the
+-- hostname has to be "localhost". Ports below 1024 are blocked outright.
+Config.DEFAULT_HOST = "localhost"
+Config.DEFAULT_PORT = 34873
+
+-- Event coalescing. A burst of DataModel churn becomes one request, not one per change.
+Config.FLUSH_DEBOUNCE = 0.25
+Config.FLUSH_DEBOUNCE_THROTTLED = 1.0
+
+-- HttpService allows roughly 500 plugin requests per minute. Stay well under.
+Config.REQUEST_BUDGET_PER_MINUTE = 300
+
+-- Ceiling on the outbound queue, so a long VS Code outage cannot grow it without bound.
+Config.MAX_QUEUED_EVENTS = 4000
+
+-- Reconnect backoff ladder, in seconds.
+Config.BACKOFF = { 1, 2, 5, 10 }
+
+-- Above this many children we stop attaching per-child listeners to a subscribed node
+-- and settle for parent-level add/remove events. Protects places with giant folders.
+Config.PER_CHILD_LISTENER_LIMIT = 2000
+
+local SETTING_KEY = "ExplorerLink_Config_v1"
+
+type Stored = { host: string?, port: number?, token: string?, autoConnect: boolean? }
+
+local cached: Stored? = nil
+
+local function load(pluginRef: Plugin): Stored
+		if cached then
+			return cached
+		end
+		local ok, value = pcall(function()
+			return pluginRef:GetSetting(SETTING_KEY)
+		end)
+		local stored: Stored = {}
+		if ok and type(value) == "table" then
+			stored = value :: any
+		end
+		cached = stored
+		return stored
+end
+
+function Config.get(pluginRef: Plugin): { host: string, port: number, token: string, autoConnect: boolean }
+		local stored = load(pluginRef)
+		return {
+			host = stored.host or Config.DEFAULT_HOST,
+			port = stored.port or Config.DEFAULT_PORT,
+			-- Empty means "no pairing token yet"; the extension shows one in its status bar.
+			token = stored.token or "",
+			autoConnect = if stored.autoConnect == nil then true else stored.autoConnect,
+		}
+end
+
+function Config.set(pluginRef: Plugin, patch: Stored)
+		local stored = load(pluginRef)
+		for key, value in pairs(patch :: any) do
+			(stored :: any)[key] = value
+		end
+		cached = stored
+		pcall(function()
+			pluginRef:SetSetting(SETTING_KEY, stored)
+		end)
+end
+
+function Config.baseUrl(pluginRef: Plugin): string
+		local settings = Config.get(pluginRef)
+		return string.format("http://%s:%d", settings.host, settings.port)
+end
+
+return Config
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX5">
+			<Properties>
+				<string name="Name">Log</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Log — prefixed output with a verbosity switch.
+
+		Connection churn is normal and expected (VS Code closes, Studio keeps running), so
+		routine transport failures log at debug level and stay out of the user's Output
+		window unless they turn verbose on.
+]]
+
+local Log = {}
+
+local PREFIX = "[ExplorerLink]"
+
+Log.verbose = false
+
+function Log.info(...: any)
+		print(PREFIX, ...)
+end
+
+function Log.warnf(...: any)
+		warn(PREFIX, ...)
+end
+
+function Log.debug(...: any)
+		if Log.verbose then
+			print(PREFIX, "(debug)", ...)
+		end
+end
+
+return Log
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX6">
+			<Properties>
+				<string name="Name">PropertySpecs</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		PropertySpecs — which properties to show, grouped like Studio's Properties window.
+
+		Plugins have no reflection API, so there is no way to enumerate an arbitrary class's
+		properties at runtime. Rather than ship (or download) a multi-megabyte API dump that
+		goes stale, this is a curated table keyed by base class: every group whose class the
+		instance IsA contributes its rows, most general first.
+
+		Reads are pcall-guarded, and a property that errors or does not exist is simply
+		omitted — so a group can safely list a property that only some subclasses have.
+]]
+
+local Serializer = require(script.Parent.Serializer)
+
+local PropertySpecs = {}
+
+type Group = { class: string, name: string, keys: { string } }
+
+-- Ordered general -> specific, matching how Studio stacks inherited sections.
+local GROUPS: { Group } = {
+		{
+			class = "Instance",
+			name = "Instance",
+			keys = { "Name", "ClassName", "Archivable" },
+		},
+		{
+			class = "PVInstance",
+			name = "Transform",
+			keys = { "Origin", "Pivot" },
+		},
+		{
+			class = "BasePart",
+			name = "Part",
+			keys = {
+				"Size",
+				"Position",
+				"Rotation",
+				"Anchored",
+				"CanCollide",
+				"CanQuery",
+				"CanTouch",
+				"Massless",
+				"Material",
+				"MaterialVariant",
+				"Color",
+				"BrickColor",
+				"Transparency",
+				"Reflectance",
+				"CastShadow",
+				"CollisionGroup",
+				"RootPriority",
+				"AssemblyLinearVelocity",
+				"AssemblyAngularVelocity",
+				"AssemblyMass",
+				"CustomPhysicalProperties",
+				"Shape",
+			},
+		},
+		{
+			class = "MeshPart",
+			name = "Mesh",
+			keys = { "MeshId", "TextureID", "RenderFidelity", "CollisionFidelity", "DoubleSided" },
+		},
+		{
+			class = "Model",
+			name = "Model",
+			keys = { "PrimaryPart", "ModelStreamingMode", "LevelOfDetail", "WorldPivot" },
+		},
+		{
+			class = "LuaSourceContainer",
+			name = "Script",
+			keys = { "Disabled", "RunContext", "LinkedSource", "Enabled" },
+		},
+		{
+			class = "GuiObject",
+			name = "Gui",
+			keys = {
+				"Position",
+				"Size",
+				"AnchorPoint",
+				"AutomaticSize",
+				"BackgroundColor3",
+				"BackgroundTransparency",
+				"BorderSizePixel",
+				"BorderColor3",
+				"ClipsDescendants",
+				"LayoutOrder",
+				"Rotation",
+				"Visible",
+				"ZIndex",
+				"Active",
+				"Selectable",
+			},
+		},
+		{
+			class = "TextLabel",
+			name = "Text",
+			keys = {
+				"Text",
+				"FontFace",
+				"TextColor3",
+				"TextSize",
+				"TextScaled",
+				"TextWrapped",
+				"TextXAlignment",
+				"TextYAlignment",
+				"TextTransparency",
+				"RichText",
+			},
+		},
+		{
+			class = "TextButton",
+			name = "Text",
+			keys = {
+				"Text",
+				"FontFace",
+				"TextColor3",
+				"TextSize",
+				"TextScaled",
+				"TextWrapped",
+				"AutoButtonColor",
+			},
+		},
+		{
+			class = "TextBox",
+			name = "Text",
+			keys = { "Text", "PlaceholderText", "FontFace", "TextColor3", "TextSize", "ClearTextOnFocus", "MultiLine" },
+		},
+		{
+			class = "ImageLabel",
+			name = "Image",
+			keys = { "Image", "ImageColor3", "ImageTransparency", "ScaleType", "SliceCenter", "TileSize" },
+		},
+		{
+			class = "ImageButton",
+			name = "Image",
+			keys = { "Image", "HoverImage", "PressedImage", "ImageColor3", "ImageTransparency", "ScaleType" },
+		},
+		{
+			class = "LayerCollector",
+			name = "Gui",
+			keys = { "Enabled", "ResetOnSpawn", "DisplayOrder", "IgnoreGuiInset", "ZIndexBehavior" },
+		},
+		{
+			class = "ScrollingFrame",
+			name = "Scrolling",
+			keys = { "CanvasSize", "CanvasPosition", "AutomaticCanvasSize", "ScrollBarThickness", "ScrollingDirection" },
+		},
+		{
+			class = "UIListLayout",
+			name = "Layout",
+			keys = { "FillDirection", "Padding", "SortOrder", "HorizontalAlignment", "VerticalAlignment", "Wraps" },
+		},
+		{
+			class = "UIGridLayout",
+			name = "Layout",
+			keys = { "CellSize", "CellPadding", "FillDirection", "SortOrder", "StartCorner" },
+		},
+		{
+			class = "UIPadding",
+			name = "Padding",
+			keys = { "PaddingTop", "PaddingBottom", "PaddingLeft", "PaddingRight" },
+		},
+		{
+			class = "UICorner",
+			name = "Corner",
+			keys = { "CornerRadius" },
+		},
+		{
+			class = "UIStroke",
+			name = "Stroke",
+			keys = { "Color", "Thickness", "Transparency", "ApplyStrokeMode", "LineJoinMode" },
+		},
+		{
+			class = "ValueBase",
+			name = "Value",
+			keys = { "Value" },
+		},
+		{
+			class = "Humanoid",
+			name = "Humanoid",
+			keys = {
+				"Health",
+				"MaxHealth",
+				"WalkSpeed",
+				"JumpPower",
+				"JumpHeight",
+				"UseJumpPower",
+				"HipHeight",
+				"AutoRotate",
+				"PlatformStand",
+				"RigType",
+				"DisplayName",
+			},
+		},
+		{
+			class = "Attachment",
+			name = "Attachment",
+			keys = { "CFrame", "Position", "Orientation", "Visible", "WorldPosition" },
+		},
+		{
+			class = "Constraint",
+			name = "Constraint",
+			keys = { "Attachment0", "Attachment1", "Enabled", "Visible", "Color" },
+		},
+		{
+			class = "JointInstance",
+			name = "Joint",
+			keys = { "Part0", "Part1", "C0", "C1", "Enabled" },
+		},
+		{
+			class = "Sound",
+			name = "Sound",
+			keys = { "SoundId", "Volume", "Playing", "Looped", "PlaybackSpeed", "TimePosition", "TimeLength", "RollOffMode" },
+		},
+		{
+			class = "Light",
+			name = "Light",
+			keys = { "Brightness", "Color", "Enabled", "Shadows", "Range", "Angle", "Face" },
+		},
+		{
+			class = "Decal",
+			name = "Decal",
+			keys = { "Texture", "Face", "Color3", "Transparency", "ZIndex" },
+		},
+		{
+			class = "ParticleEmitter",
+			name = "Emitter",
+			keys = { "Texture", "Rate", "Lifetime", "Speed", "Enabled", "Color", "Size", "Transparency", "SpreadAngle" },
+		},
+		{
+			class = "Beam",
+			name = "Beam",
+			keys = { "Attachment0", "Attachment1", "Texture", "Width0", "Width1", "Color", "Enabled", "FaceCamera" },
+		},
+		{
+			class = "Camera",
+			name = "Camera",
+			keys = { "CFrame", "CameraType", "FieldOfView", "CameraSubject", "Focus" },
+		},
+		{
+			class = "Tool",
+			name = "Tool",
+			keys = { "Grip", "CanBeDropped", "Enabled", "RequiresHandle", "ToolTip", "TextureId" },
+		},
+		{
+			class = "ProximityPrompt",
+			name = "Prompt",
+			keys = { "ActionText", "ObjectText", "HoldDuration", "MaxActivationDistance", "Enabled", "RequiresLineOfSight" },
+		},
+		{
+			class = "ClickDetector",
+			name = "Click",
+			keys = { "MaxActivationDistance", "CursorIcon" },
+		},
+		{
+			class = "SpawnLocation",
+			name = "Spawn",
+			keys = { "Enabled", "Neutral", "TeamColor", "Duration", "AllowTeamChangeOnTouch" },
+		},
+		{
+			class = "Terrain",
+			name = "Terrain",
+			keys = { "WaterColor", "WaterTransparency", "WaterWaveSize", "WaterWaveSpeed", "Decoration", "MaxExtents" },
+		},
+		{
+			class = "Animation",
+			name = "Animation",
+			keys = { "AnimationId" },
+		},
+		{
+			class = "SurfaceAppearance",
+			name = "Surface",
+			keys = { "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "AlphaMode" },
+		},
+}
+
+--- Reads one property, returning nil if it does not exist or errors.
+local function readRow(instance: Instance, key: string): { [string]: any }?
+		local ok, value = pcall(function()
+			return (instance :: any)[key]
+		end)
+		if not ok then
+			return nil
+		end
+		-- ClassName is a string but deserves its own kind so the extension can style it.
+		if key == "ClassName" then
+			return { key = key, value = tostring(value), kind = "class" }
+		end
+		local display, kind = Serializer.formatValue(value)
+		return { key = key, value = display, kind = kind }
+end
+
+--- Builds every applicable group for an instance, plus Attributes and Tags when present.
+function PropertySpecs.groupsFor(instance: Instance): { { [string]: any } }
+		local out = {}
+		local seenKeys: { [string]: boolean } = {}
+
+		for _, group in ipairs(GROUPS) do
+			local okIsA, isA = pcall(function()
+				return instance:IsA(group.class)
+			end)
+			if okIsA and isA then
+				local rows = {}
+				for _, key in ipairs(group.keys) do
+					if not seenKeys[key] then
+						local row = readRow(instance, key)
+						if row then
+							seenKeys[key] = true
+							rows[#rows + 1] = row
+						end
+					end
+				end
+				if #rows > 0 then
+					out[#out + 1] = { name = group.name, rows = rows }
+				end
+			end
+		end
+
+		local okAttributes, attributes = pcall(function()
+			return instance:GetAttributes()
+		end)
+		if okAttributes and attributes then
+			local rows = {}
+			local names = {}
+			for name in pairs(attributes) do
+				names[#names + 1] = name
+			end
+			table.sort(names)
+			for _, name in ipairs(names) do
+				local display, kind = Serializer.formatValue(attributes[name])
+				rows[#rows + 1] = { key = name, value = display, kind = kind }
+			end
+			if #rows > 0 then
+				out[#out + 1] = { name = "Attributes", rows = rows }
+			end
+		end
+
+		local okTags, tags = pcall(function()
+			return game:GetService("CollectionService"):GetTags(instance)
+		end)
+		if okTags and tags and #tags > 0 then
+			table.sort(tags)
+			local rows = {}
+			for index, tag in ipairs(tags) do
+				rows[#rows + 1] = { key = tostring(index), value = tag, kind = "string" }
+			end
+			out[#out + 1] = { name = "Tags", rows = rows }
+		end
+
+		return out
+end
+
+return PropertySpecs
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX7">
+			<Properties>
+				<string name="Name">Registry</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Registry — opaque refs for instances.
+
+		VS Code never receives an Instance, only a string like "i:42". Refs are minted on
+		demand (the first time an instance is serialized) and stay stable for the life of
+		the session.
+
+		Cleanup is lazy rather than eager. Connecting Destroying on every instance we have
+		ever sent would cost more than it saves, so instead a ref resolves to nil once its
+		instance leaves the DataModel, and dead entries are swept periodically.
+]]
+
+local Registry = {}
+
+local nextId = 0
+local byRef: { [string]: Instance } = {}
+local byInstance: { [Instance]: string } = {}
+
+--- Returns the existing ref for `instance`, minting one if this is the first time we
+--- have seen it.
+function Registry.refFor(instance: Instance): string
+		local existing = byInstance[instance]
+		if existing then
+			return existing
+		end
+		nextId += 1
+		local ref = "i:" .. nextId
+		byRef[ref] = instance
+		byInstance[instance] = ref
+		return ref
+end
+
+--- Resolves a ref to a live instance, or nil if it is stale.
+---
+--- `game` itself is not a descendant of `game`, so it gets an explicit pass.
+function Registry.resolve(ref: string): Instance?
+		local instance = byRef[ref]
+		if not instance then
+			return nil
+		end
+		if instance == game then
+			return instance
+		end
+		local ok, alive = pcall(function()
+			return instance:IsDescendantOf(game)
+		end)
+		if not ok or not alive then
+			byRef[ref] = nil
+			byInstance[instance] = nil
+			return nil
+		end
+		return instance
+end
+
+--- Looks up a ref without minting one. Used when reporting removals: an instance we
+--- never sent to VS Code does not need to be announced.
+function Registry.existingRef(instance: Instance): string?
+		return byInstance[instance]
+end
+
+function Registry.forget(instance: Instance)
+		local ref = byInstance[instance]
+		if ref then
+			byRef[ref] = nil
+			byInstance[instance] = nil
+		end
+end
+
+--- Drops entries whose instances have left the DataModel. Cheap enough to run on a
+--- timer; the whole map is only as large as what the user has actually expanded.
+function Registry.sweep(): number
+		local removed = 0
+		for ref, instance in pairs(byRef) do
+			local ok, alive = pcall(function()
+				return instance == game or instance:IsDescendantOf(game)
+			end)
+			if not ok or not alive then
+				byRef[ref] = nil
+				byInstance[instance] = nil
+				removed += 1
+			end
+		end
+		return removed
+end
+
+function Registry.clear()
+		byRef = {}
+		byInstance = {}
+		nextId = 0
+end
+
+function Registry.size(): number
+		local count = 0
+		for _ in pairs(byRef) do
+			count += 1
+		end
+		return count
+end
+
+return Registry
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX8">
+			<Properties>
+				<string name="Name">Serializer</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Serializer — turns instances and property values into the JSON shapes in PROTOCOL.md.
+
+		Two jobs:
+		  * node(instance) -> the tree row VS Code renders
+		  * formatValue(v) -> a display string plus a `kind` used for colouring
+]]
+
+local ClassTags = require(script.Parent.ClassTags)
+local Registry = require(script.Parent.Registry)
+
+local Serializer = {}
+
+local MAX_STRING = 240
+
+--- game.Workspace.Sword.Handle — built by walking up rather than using GetFullName so
+--- that names with dots or brackets do not silently produce an ambiguous path.
+local function fullPath(instance: Instance): string
+		if instance == game then
+			return "game"
+		end
+		local segments: { string } = {}
+		local current: Instance? = instance
+		while current and current ~= game do
+			table.insert(segments, 1, current.Name)
+			current = current.Parent
+		end
+		if current ~= game then
+			-- Detached from the DataModel; report what we have without the game prefix.
+			return table.concat(segments, ".")
+		end
+		return "game." .. table.concat(segments, ".")
+end
+
+Serializer.fullPath = fullPath
+
+--- The same walk, returned as segments. VS Code uses this to reveal a row by expanding
+--- one ancestor at a time, which a dotted string cannot support unambiguously once a
+--- name contains a dot.
+function Serializer.pathSegments(instance: Instance): { string }
+		local segments: { string } = {}
+		local current: Instance? = instance
+		while current and current ~= game do
+			table.insert(segments, 1, current.Name)
+			current = current.Parent
+		end
+		return segments
+end
+
+local function truncate(text: string): string
+		if #text <= MAX_STRING then
+			return text
+		end
+		return string.sub(text, 1, MAX_STRING) .. "…"
+end
+
+local function round(n: number): string
+		if n ~= n then
+			return "nan"
+		end
+		if n == math.huge then
+			return "inf"
+		end
+		if n == -math.huge then
+			return "-inf"
+		end
+		if math.abs(n - math.floor(n)) < 1e-9 then
+			return string.format("%d", n)
+		end
+		-- The outer parentheses matter: gsub returns (string, count), and without them the
+		-- count leaks into whatever argument list this call ends up in.
+		return (string.format("%.3f", n):gsub("0+$", ""):gsub("%.$", ""))
+end
+
+--- Returns (displayString, kind). `kind` is a coarse type name the extension maps to a
+--- colour; it is never parsed.
+function Serializer.formatValue(value: any): (string, string)
+		local valueType = typeof(value)
+
+		if valueType == "string" then
+			return truncate(value), "string"
+		elseif valueType == "number" then
+			return round(value), "number"
+		elseif valueType == "boolean" then
+			return tostring(value), "bool"
+		elseif valueType == "nil" then
+			return "nil", "nil"
+		elseif valueType == "EnumItem" then
+			return tostring(value):gsub("^Enum%.", ""), "enum"
+		elseif valueType == "Vector3" then
+			return string.format("%s, %s, %s", round(value.X), round(value.Y), round(value.Z)), "Vector3"
+		elseif valueType == "Vector2" then
+			return string.format("%s, %s", round(value.X), round(value.Y)), "Vector2"
+		elseif valueType == "UDim" then
+			return string.format("%s, %s", round(value.Scale), round(value.Offset)), "UDim"
+		elseif valueType == "UDim2" then
+			return string.format(
+				"{%s, %s}, {%s, %s}",
+				round(value.X.Scale),
+				round(value.X.Offset),
+				round(value.Y.Scale),
+				round(value.Y.Offset)
+			),
+				"UDim2"
+		elseif valueType == "CFrame" then
+			local position = value.Position
+			local rx, ry, rz = value:ToOrientation()
+			return string.format(
+				"%s, %s, %s  ∠ %s, %s, %s",
+				round(position.X),
+				round(position.Y),
+				round(position.Z),
+				round(math.deg(rx)),
+				round(math.deg(ry)),
+				round(math.deg(rz))
+			),
+				"CFrame"
+		elseif valueType == "Color3" then
+			return string.format("#%02X%02X%02X", value.R * 255, value.G * 255, value.B * 255), "Color3"
+		elseif valueType == "BrickColor" then
+			return value.Name, "BrickColor"
+		elseif valueType == "NumberRange" then
+			return string.format("%s .. %s", round(value.Min), round(value.Max)), "NumberRange"
+		elseif valueType == "NumberSequence" or valueType == "ColorSequence" then
+			return string.format("%d keypoints", #value.Keypoints), valueType
+		elseif valueType == "Rect" then
+			return string.format(
+				"{%s, %s}, {%s, %s}",
+				round(value.Min.X),
+				round(value.Min.Y),
+				round(value.Max.X),
+				round(value.Max.Y)
+			),
+				"Rect"
+		elseif valueType == "Instance" then
+			return fullPath(value), "Instance"
+		elseif valueType == "Font" then
+			return tostring(value.Family):gsub("^rbxasset://fonts/families/", ""):gsub("%.json$", ""), "Font"
+		elseif valueType == "PhysicalProperties" then
+			return string.format("density %s, friction %s", round(value.Density), round(value.Friction)), "PhysicalProperties"
+		end
+
+		return truncate(tostring(value)), valueType
+end
+
+--- A tree row. `childCount` lets VS Code draw the expand twisty without a round trip.
+function Serializer.node(instance: Instance): { [string]: any }
+		local childCount = 0
+		local okChildren, children = pcall(function()
+			return instance:GetChildren()
+		end)
+		if okChildren then
+			childCount = #children
+		end
+
+		local isScript = instance:IsA("LuaSourceContainer")
+		local disabled = false
+		if isScript and (instance:IsA("Script") or instance:IsA("LocalScript")) then
+			local ok, value = pcall(function()
+				return (instance :: any).Disabled
+			end)
+			disabled = ok and value == true
+		end
+
+		local isService = false
+		if instance.Parent == game then
+			isService = true
+		end
+
+		return {
+			ref = Registry.refFor(instance),
+			name = instance.Name,
+			className = instance.ClassName,
+			path = fullPath(instance),
+			tags = ClassTags.forInstance(instance),
+			childCount = childCount,
+			flags = {
+				script = isScript,
+				disabled = disabled,
+				service = isService,
+			},
+		}
+end
+
+--- Serializes an instance's children, skipping any that error on access.
+function Serializer.children(instance: Instance): { { [string]: any } }
+		local nodes = {}
+		local ok, children = pcall(function()
+			return instance:GetChildren()
+		end)
+		if not ok then
+			return nodes
+		end
+		for _, child in ipairs(children) do
+			local okNode, node = pcall(Serializer.node, child)
+			if okNode then
+				nodes[#nodes + 1] = node
+			end
+		end
+		return nodes
+end
+
+return Serializer
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX9">
+			<Properties>
+				<string name="Name">Transport</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Transport — the HTTP client half of the link.
+
+		Two cooperating loops, because one cannot do both jobs well:
+
+		  * the poll loop holds a long request open (up to holdMs) waiting for commands from
+		    VS Code, so an expand in the sidebar reaches Studio in milliseconds;
+		  * the flush loop pushes queued events up, immediately when they are command
+		    results and on a debounce when they are DataModel churn.
+
+		Together they cost ~3 requests/minute at rest, well inside HttpService's ~500/minute
+		plugin budget, and the budget is tracked anyway: if the place is thrashing, the
+		debounce stretches rather than the link dying with a 429.
+]]
+
+local HttpService = game:GetService("HttpService")
+
+local Commands = require(script.Parent.Commands)
+local Config = require(script.Parent.Config)
+local Log = require(script.Parent.Log)
+local Registry = require(script.Parent.Registry)
+local Watcher = require(script.Parent.Watcher)
+
+local Transport = {}
+Transport.__index = Transport
+
+export type Status = "offline" | "connecting" | "connected"
+
+export type Transport = typeof(setmetatable(
+		{} :: {
+			pluginRef: Plugin,
+			watcher: Watcher.Watcher,
+			running: boolean,
+			sessionId: string?,
+			token: string?,
+			holdMs: number,
+			queue: { { [string]: any } },
+			urgent: boolean,
+			backoffIndex: number,
+			requestTimes: { number },
+			status: Status,
+			statusMessage: string,
+			onStatus: ((Status, string) -> ())?,
+		},
+		Transport
+))
+
+function Transport.new(pluginRef: Plugin, watcher: Watcher.Watcher): Transport
+		local self = setmetatable({
+			pluginRef = pluginRef,
+			watcher = watcher,
+			running = false,
+			sessionId = nil,
+			token = nil,
+			holdMs = 20000,
+			queue = {},
+			urgent = false,
+			backoffIndex = 1,
+			requestTimes = {},
+			status = "offline" :: Status,
+			statusMessage = "Not connected",
+			onStatus = nil,
+		}, Transport)
+		return (self :: any) :: Transport
+end
+
+local function setStatus(self: Transport, status: Status, message: string)
+		if self.status == status and self.statusMessage == message then
+			return
+		end
+		self.status = status
+		self.statusMessage = message
+		if self.onStatus then
+			self.onStatus(status, message)
+		end
+end
+
+--- Queues an event for the next flush. `result` events mark the flush urgent so command
+--- round trips are not held up by the change debounce.
+function Transport.emit(self: Transport, event: { [string]: any })
+		-- While VS Code is gone the watchers keep firing, so the queue needs a ceiling.
+		-- Dropping the oldest is safe: reconnecting re-handshakes and resends the roots,
+		-- and VS Code re-fetches whatever it has open from scratch.
+		if #self.queue >= Config.MAX_QUEUED_EVENTS then
+			table.remove(self.queue, 1)
+		end
+		self.queue[#self.queue + 1] = event
+		if event.type == "result" then
+			self.urgent = true
+		end
+end
+
+local function recordRequest(self: Transport)
+		local now = os.clock()
+		table.insert(self.requestTimes, now)
+		-- Drop anything older than a minute.
+		local cutoff = now - 60
+		while #self.requestTimes > 0 and self.requestTimes[1] < cutoff do
+			table.remove(self.requestTimes, 1)
+		end
+end
+
+local function isThrottled(self: Transport): boolean
+		return #self.requestTimes >= Config.REQUEST_BUDGET_PER_MINUTE
+end
+
+type HttpResult = { ok: boolean, status: number, body: any, err: string? }
+
+local function request(self: Transport, path: string, payload: { [string]: any }): HttpResult
+		recordRequest(self)
+
+		local headers: { [string]: string } = { ["Content-Type"] = "application/json" }
+		if self.token then
+			headers["X-Rel-Token"] = self.token
+		end
+		if self.sessionId then
+			headers["X-Rel-Session"] = self.sessionId
+		end
+
+		local encoded
+		local okEncode, encodeErr = pcall(function()
+			encoded = HttpService:JSONEncode(payload)
+		end)
+		if not okEncode then
+			return { ok = false, status = 0, body = nil, err = "encode:" .. tostring(encodeErr) }
+		end
+
+		local ok, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = Config.baseUrl(self.pluginRef) .. path,
+				Method = "POST",
+				Headers = headers,
+				Body = encoded,
+			})
+		end)
+
+		if not ok then
+			-- Connection refused, DNS failure, trust check, timeout: all land here.
+			return { ok = false, status = 0, body = nil, err = tostring(response) }
+		end
+
+		local decoded: any = nil
+		if response.Body and #response.Body > 0 then
+			local okDecode, value = pcall(function()
+				return HttpService:JSONDecode(response.Body)
+			end)
+			if okDecode then
+				decoded = value
+			end
+		end
+
+		return {
+			ok = response.StatusCode >= 200 and response.StatusCode < 300,
+			status = response.StatusCode,
+			body = decoded,
+			err = if response.StatusCode >= 300 then response.StatusMessage else nil,
+		}
+end
+
+local function backoffSeconds(self: Transport): number
+		local ladder = Config.BACKOFF
+		local seconds = ladder[math.min(self.backoffIndex, #ladder)]
+		self.backoffIndex += 1
+		return seconds
+end
+
+function Transport.handshake(self: Transport): boolean
+		setStatus(self, "connecting", "Looking for VS Code…")
+
+		local settings = Config.get(self.pluginRef)
+		self.token = if settings.token ~= "" then settings.token else nil
+
+		local studioVersion = ""
+		pcall(function()
+			studioVersion = version()
+		end)
+
+		local result = request(self, "/hello", {
+			protocol = Config.PROTOCOL,
+			pluginVersion = Config.VERSION,
+			placeName = game.Name,
+			placeId = game.PlaceId,
+			studioVersion = studioVersion,
+			isEditMode = game:GetService("RunService"):IsEdit(),
+		})
+
+		if not result.ok then
+			if result.status == 401 then
+				setStatus(self, "offline", "Token rejected — copy it from the VS Code status bar")
+				-- A wrong token will not fix itself; back off hard rather than hammering.
+				self.backoffIndex = #Config.BACKOFF
+			else
+				setStatus(self, "offline", "VS Code not listening")
+			end
+			Log.debug("handshake failed:", result.status, result.err)
+			return false
+		end
+
+		local body = result.body
+		if type(body) ~= "table" or not body.sessionId then
+			setStatus(self, "offline", "Unexpected reply from VS Code")
+			return false
+		end
+
+		if body.protocol and body.protocol ~= Config.PROTOCOL then
+			setStatus(
+				self,
+				"offline",
+				string.format("Version mismatch: extension speaks v%s, plugin speaks v%d", tostring(body.protocol), Config.PROTOCOL)
+			)
+			self.backoffIndex = #Config.BACKOFF
+			return false
+		end
+
+		self.sessionId = body.sessionId
+		self.holdMs = body.holdMs or 20000
+		self.backoffIndex = 1
+		self.queue = {}
+
+		setStatus(self, "connected", "Linked to VS Code")
+		Log.info("connected to VS Code (session " .. tostring(body.sessionId):sub(1, 8) .. ")")
+
+		-- The root rows are the one thing VS Code cannot ask for lazily: it has no ref yet.
+		Transport.emit(self, { type = "roots", nodes = Commands.roots() })
+		Transport.emit(self, { type = "placeChanged", placeName = game.Name, placeId = game.PlaceId })
+		self.urgent = true
+
+		return true
+end
+
+local function drain(self: Transport): { { [string]: any } }
+		local events = self.queue
+		self.queue = {}
+		self.urgent = false
+		return events
+end
+
+--- One /poll round trip. `hold` asks the server to keep the connection open when it has
+--- nothing to say.
+function Transport.poll(self: Transport, hold: boolean)
+		local events = if hold then {} else drain(self)
+
+		local result = request(self, "/poll", { events = events, want = hold })
+
+		if not result.ok then
+			-- Put the events back rather than dropping them: a lost childAdded leaves
+			-- VS Code showing a tree that is quietly wrong until the next manual refresh.
+			-- A dead session is the exception — those events describe a tree nobody has.
+			if #events > 0 and result.status ~= 409 then
+				for index = #events, 1, -1 do
+					table.insert(self.queue, 1, events[index])
+				end
+			end
+
+			if result.status == 409 then
+				Log.debug("session expired; re-handshaking")
+				self.sessionId = nil
+				setStatus(self, "connecting", "VS Code restarted — reconnecting")
+				return
+			end
+			if result.status == 429 then
+				task.wait(2)
+				return
+			end
+			if result.status == 503 or result.status == 0 then
+				self.sessionId = nil
+				setStatus(self, "offline", "VS Code not listening")
+				return
+			end
+			Log.debug("poll failed:", result.status, result.err)
+			return
+		end
+
+		local body = result.body
+		if type(body) ~= "table" then
+			return
+		end
+
+		local commands = body.commands
+		if type(commands) ~= "table" then
+			return
+		end
+
+		local context: Commands.Context = { watcher = self.watcher, pluginRef = self.pluginRef }
+		for _, command in ipairs(commands) do
+			Transport.emit(self, Commands.dispatch(context, command))
+		end
+end
+
+function Transport.start(self: Transport)
+		if self.running then
+			return
+		end
+		self.running = true
+
+		-- Poll loop: reconnects, then holds a long request open waiting for commands.
+		task.spawn(function()
+			while self.running do
+				if not self.sessionId then
+					local ok = Transport.handshake(self)
+					if not ok then
+						task.wait(backoffSeconds(self))
+						continue
+					end
+				end
+				local ok, err = pcall(Transport.poll, self, true)
+				if not ok then
+					Log.debug("poll loop error:", err)
+					task.wait(1)
+				end
+			end
+		end)
+
+		-- Flush loop: pushes queued events up.
+		task.spawn(function()
+			local lastFlush = 0
+			while self.running do
+				task.wait(0.05)
+				if not self.sessionId or #self.queue == 0 then
+					continue
+				end
+				local debounce = if isThrottled(self) then Config.FLUSH_DEBOUNCE_THROTTLED else Config.FLUSH_DEBOUNCE
+				local due = self.urgent or (os.clock() - lastFlush) >= debounce
+				if due then
+					lastFlush = os.clock()
+					local ok, err = pcall(Transport.poll, self, false)
+					if not ok then
+						Log.debug("flush loop error:", err)
+					end
+				end
+			end
+		end)
+
+		-- Housekeeping: drop refs whose instances have been destroyed.
+		task.spawn(function()
+			while self.running do
+				task.wait(30)
+				Registry.sweep()
+			end
+		end)
+end
+
+function Transport.stop(self: Transport, reason: string)
+		if not self.running then
+			return
+		end
+		self.running = false
+		if self.sessionId then
+			-- Best effort; if VS Code has already gone the failure is meaningless.
+			pcall(function()
+				request(self, "/poll", { events = { { type = "bye", reason = reason } }, want = false })
+			end)
+		end
+		self.sessionId = nil
+		setStatus(self, "offline", "Disconnected")
+end
+
+--- Forces an immediate reconnect, used by the toolbar button.
+function Transport.reconnect(self: Transport)
+		self.sessionId = nil
+		self.backoffIndex = 1
+		setStatus(self, "connecting", "Reconnecting…")
+end
+
+return Transport
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX10">
+			<Properties>
+				<string name="Name">Ui</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Ui — toolbar button and a small dock widget.
+
+		The widget exists for exactly three things: see whether the link is up, paste the
+		pairing token, and change the port. Everything else happens in VS Code.
+
+		Colours come from Studio's own theme so the widget follows dark/light automatically.
+]]
+
+local Config = require(script.Parent.Config)
+
+local Ui = {}
+Ui.__index = Ui
+
+export type Ui = typeof(setmetatable(
+		{} :: {
+			pluginRef: Plugin,
+			widget: DockWidgetPluginGui,
+			button: PluginToolbarButton,
+			statusLabel: TextLabel,
+			statusDot: Frame,
+			detailLabel: TextLabel,
+			tokenBox: TextBox,
+			portBox: TextBox,
+			onReconnect: (() -> ())?,
+			connections: { RBXScriptConnection },
+		},
+		Ui
+))
+
+local COLORS = {
+		offline = Color3.fromRGB(198, 82, 82),
+		connecting = Color3.fromRGB(214, 165, 68),
+		connected = Color3.fromRGB(88, 176, 106),
+}
+
+local function studioColor(item: Enum.StudioStyleGuideColor, modifier: Enum.StudioStyleGuideModifier?): Color3
+		local theme = settings().Studio.Theme
+		return theme:GetColor(item, modifier or Enum.StudioStyleGuideModifier.Default)
+end
+
+local function makeLabel(parent: Instance, text: string, size: UDim2, position: UDim2, bold: boolean): TextLabel
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = size
+		label.Position = position
+		label.Font = if bold then Enum.Font.GothamBold else Enum.Font.Gotham
+		label.TextSize = if bold then 14 else 12
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextYAlignment = Enum.TextYAlignment.Center
+		label.Text = text
+		label.TextColor3 = studioColor(Enum.StudioStyleGuideColor.MainText)
+		label.Parent = parent
+		return label
+end
+
+local function makeBox(parent: Instance, placeholder: string, position: UDim2, width: number): TextBox
+		local box = Instance.new("TextBox")
+		box.Size = UDim2.new(0, width, 0, 26)
+		box.Position = position
+		box.Font = Enum.Font.Code
+		box.TextSize = 13
+		box.ClearTextOnFocus = false
+		box.PlaceholderText = placeholder
+		box.Text = ""
+		box.TextXAlignment = Enum.TextXAlignment.Left
+		box.BackgroundColor3 = studioColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+		box.TextColor3 = studioColor(Enum.StudioStyleGuideColor.MainText)
+		box.PlaceholderColor3 = studioColor(Enum.StudioStyleGuideColor.DimmedText)
+		box.BorderSizePixel = 0
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 8)
+		padding.Parent = box
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 4)
+		corner.Parent = box
+
+		box.Parent = parent
+		return box
+end
+
+function Ui.new(pluginRef: Plugin, toolbar: PluginToolbar): Ui
+		local button = toolbar:CreateButton(
+			"Explorer Link",
+			"Open the Explorer Link panel — mirrors this place's Explorer into VS Code",
+			"rbxasset://textures/StudioSharedUI/menu.png"
+		)
+		button.ClickableWhenViewportHidden = true
+
+		local widget = pluginRef:CreateDockWidgetPluginGui(
+			"ExplorerLink_Panel",
+			DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 320, 220, 300, 200)
+		)
+		widget.Title = "Explorer Link"
+		widget.Name = "ExplorerLink"
+		widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+		local root = Instance.new("Frame")
+		root.Size = UDim2.fromScale(1, 1)
+		root.BackgroundColor3 = studioColor(Enum.StudioStyleGuideColor.MainBackground)
+		root.BorderSizePixel = 0
+		root.Parent = widget
+
+		local statusDot = Instance.new("Frame")
+		statusDot.Size = UDim2.fromOffset(10, 10)
+		statusDot.Position = UDim2.fromOffset(14, 17)
+		statusDot.BackgroundColor3 = COLORS.offline
+		statusDot.BorderSizePixel = 0
+		local dotCorner = Instance.new("UICorner")
+		dotCorner.CornerRadius = UDim.new(1, 0)
+		dotCorner.Parent = statusDot
+		statusDot.Parent = root
+
+		local statusLabel = makeLabel(root, "Not connected", UDim2.new(1, -40, 0, 18), UDim2.fromOffset(32, 13), true)
+		local detailLabel = makeLabel(root, "", UDim2.new(1, -40, 0, 16), UDim2.fromOffset(32, 32), false)
+		detailLabel.TextColor3 = studioColor(Enum.StudioStyleGuideColor.DimmedText)
+
+		makeLabel(root, "Pairing token", UDim2.new(1, -28, 0, 14), UDim2.fromOffset(14, 62), false).TextColor3 =
+			studioColor(Enum.StudioStyleGuideColor.DimmedText)
+		local tokenBox = makeBox(root, "paste from the VS Code status bar", UDim2.fromOffset(14, 78), 292)
+
+		makeLabel(root, "Port", UDim2.new(0, 100, 0, 14), UDim2.fromOffset(14, 114), false).TextColor3 =
+			studioColor(Enum.StudioStyleGuideColor.DimmedText)
+		local portBox = makeBox(root, tostring(Config.DEFAULT_PORT), UDim2.fromOffset(14, 130), 100)
+
+		local reconnect = Instance.new("TextButton")
+		reconnect.Size = UDim2.fromOffset(178, 26)
+		reconnect.Position = UDim2.fromOffset(128, 130)
+		reconnect.Text = "Save & reconnect"
+		reconnect.Font = Enum.Font.GothamMedium
+		reconnect.TextSize = 13
+		reconnect.BackgroundColor3 = studioColor(Enum.StudioStyleGuideColor.DialogMainButton)
+		reconnect.TextColor3 = studioColor(Enum.StudioStyleGuideColor.DialogMainButtonText)
+		reconnect.BorderSizePixel = 0
+		local buttonCorner = Instance.new("UICorner")
+		buttonCorner.CornerRadius = UDim.new(0, 4)
+		buttonCorner.Parent = reconnect
+		reconnect.Parent = root
+
+		local hint = makeLabel(
+			root,
+			"VS Code: run “Explorer Link: Show Pairing Token”",
+			UDim2.new(1, -28, 0, 14),
+			UDim2.fromOffset(14, 168),
+			false
+		)
+		hint.TextColor3 = studioColor(Enum.StudioStyleGuideColor.DimmedText)
+		hint.TextSize = 11
+
+		local settingsNow = Config.get(pluginRef)
+		tokenBox.Text = settingsNow.token
+		portBox.Text = tostring(settingsNow.port)
+
+		local self = setmetatable({
+			pluginRef = pluginRef,
+			widget = widget,
+			button = button,
+			statusLabel = statusLabel,
+			statusDot = statusDot,
+			detailLabel = detailLabel,
+			tokenBox = tokenBox,
+			portBox = portBox,
+			onReconnect = nil,
+			connections = {},
+		}, Ui)
+
+		table.insert(
+			self.connections,
+			button.Click:Connect(function()
+				widget.Enabled = not widget.Enabled
+			end)
+		)
+
+		table.insert(
+			self.connections,
+			reconnect.Activated:Connect(function()
+				local port = tonumber(portBox.Text) or Config.DEFAULT_PORT
+				-- Ports below 1024 are blocked for plugin requests; refuse rather than
+				-- letting the user watch a silent failure.
+				if port < 1024 or port > 65535 then
+					portBox.Text = tostring(Config.DEFAULT_PORT)
+					port = Config.DEFAULT_PORT
+				end
+				Config.set(pluginRef, { token = tokenBox.Text, port = port })
+				if self.onReconnect then
+					self.onReconnect()
+				end
+			end)
+		)
+
+		table.insert(
+			self.connections,
+			settings().Studio.ThemeChanged:Connect(function()
+				root.BackgroundColor3 = studioColor(Enum.StudioStyleGuideColor.MainBackground)
+				statusLabel.TextColor3 = studioColor(Enum.StudioStyleGuideColor.MainText)
+				detailLabel.TextColor3 = studioColor(Enum.StudioStyleGuideColor.DimmedText)
+				hint.TextColor3 = studioColor(Enum.StudioStyleGuideColor.DimmedText)
+				for _, box in ipairs({ tokenBox, portBox }) do
+					box.BackgroundColor3 = studioColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+					box.TextColor3 = studioColor(Enum.StudioStyleGuideColor.MainText)
+				end
+				reconnect.BackgroundColor3 = studioColor(Enum.StudioStyleGuideColor.DialogMainButton)
+				reconnect.TextColor3 = studioColor(Enum.StudioStyleGuideColor.DialogMainButtonText)
+			end)
+		)
+
+		return (self :: any) :: Ui
+end
+
+function Ui.setStatus(self: Ui, status: string, message: string)
+		self.statusDot.BackgroundColor3 = COLORS[status] or COLORS.offline
+		self.statusLabel.Text = if status == "connected"
+			then "Linked"
+			elseif status == "connecting" then "Connecting…"
+			else "Not connected"
+		self.detailLabel.Text = message
+		self.button:SetActive(status == "connected")
+end
+
+function Ui.destroy(self: Ui)
+		for _, connection in ipairs(self.connections) do
+			connection:Disconnect()
+		end
+		self.connections = {}
+		self.widget:Destroy()
+end
+
+return Ui
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX11">
+			<Properties>
+				<string name="Name">Watcher</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+		Watcher — change tracking, scoped to what VS Code is actually looking at.
+
+		The plugin never walks the DataModel. VS Code subscribes to a node when the user
+		expands it, and that subscription is what installs listeners:
+
+		  * ChildAdded / ChildRemoved on the node itself  -> childAdded / childRemoved
+		  * Name changed on each child                    -> nodeChanged
+		  * ChildAdded / ChildRemoved on each child       -> nodeChanged (twisty appears
+		                                                     or disappears when the child's
+		                                                     own child count crosses zero)
+
+		Collapse the node in VS Code and every one of those connections goes away, so an
+		idle session costs nothing regardless of place size.
+]]
+
+local Config = require(script.Parent.Config)
+local Log = require(script.Parent.Log)
+local Registry = require(script.Parent.Registry)
+local Serializer = require(script.Parent.Serializer)
+
+local Watcher = {}
+Watcher.__index = Watcher
+
+-- TextDocumentDidChange fires on every keystroke; VS Code only needs to know that the
+-- file moved on, not how many times.
+local SOURCE_THROTTLE = 0.75
+
+export type Emit = (event: { [string]: any }) -> ()
+
+type Subscription = {
+		instance: Instance,
+		connections: { RBXScriptConnection },
+		childConnections: { [Instance]: { RBXScriptConnection } },
+		perChild: boolean,
+}
+
+export type Watcher = typeof(setmetatable(
+		{} :: {
+			emit: Emit,
+			subscriptions: { [string]: Subscription },
+			sourceWatches: { [string]: { RBXScriptConnection } },
+			globalConnections: { RBXScriptConnection },
+			suppressSelectionEcho: boolean,
+		},
+		Watcher
+))
+
+function Watcher.new(emit: Emit): Watcher
+		local self = setmetatable({
+			emit = emit,
+			subscriptions = {},
+			sourceWatches = {},
+			globalConnections = {},
+			suppressSelectionEcho = false,
+		}, Watcher)
+		return (self :: any) :: Watcher
+end
+
+--- Mirrors Studio's selection into VS Code. Guarded by `suppressSelectionEcho` so that
+--- a selection VS Code just requested does not bounce straight back at it.
+function Watcher.startSelectionMirror(self: Watcher)
+		local selection = game:GetService("Selection")
+		table.insert(
+			self.globalConnections,
+			selection.SelectionChanged:Connect(function()
+				if self.suppressSelectionEcho then
+					return
+				end
+				local refs = {}
+				local paths = {}
+				for _, instance in ipairs(selection:Get()) do
+					refs[#refs + 1] = Registry.refFor(instance)
+					-- Segments, not a dotted string: VS Code has to walk this path node by
+					-- node to reveal the row, and a name containing a dot would otherwise
+					-- split into two segments that match nothing.
+					paths[#paths + 1] = Serializer.pathSegments(instance)
+				end
+				self.emit({ type = "selectionChanged", refs = refs, paths = paths })
+			end)
+		)
+end
+
+local function disconnectChild(subscription: Subscription, child: Instance)
+		local connections = subscription.childConnections[child]
+		if not connections then
+			return
+		end
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+		subscription.childConnections[child] = nil
+end
+
+local function watchChild(self: Watcher, subscription: Subscription, child: Instance)
+		if not subscription.perChild or subscription.childConnections[child] then
+			return
+		end
+
+		local function announce()
+			-- The instance may have been destroyed between the signal firing and this
+			-- running; a stale ref means VS Code already heard about the removal.
+			if not child:IsDescendantOf(game) then
+				return
+			end
+			local ok, node = pcall(Serializer.node, child)
+			if ok then
+				self.emit({ type = "nodeChanged", node = node })
+			end
+		end
+
+		local connections = {
+			child:GetPropertyChangedSignal("Name"):Connect(announce),
+			child.ChildAdded:Connect(announce),
+			child.ChildRemoved:Connect(announce),
+		}
+
+		if child:IsA("Script") or child:IsA("LocalScript") then
+			local ok, signal = pcall(function()
+				return child:GetPropertyChangedSignal("Disabled")
+			end)
+			if ok then
+				connections[#connections + 1] = signal:Connect(announce)
+			end
+		end
+
+		subscription.childConnections[child] = connections
+end
+
+--- Starts watching `instance`. Idempotent: re-subscribing an already-watched ref is a
+--- no-op, which lets VS Code subscribe freely on every expand.
+function Watcher.subscribe(self: Watcher, ref: string, instance: Instance)
+		if self.subscriptions[ref] then
+			return
+		end
+
+		local childCount = #instance:GetChildren()
+		local perChild = childCount <= Config.PER_CHILD_LISTENER_LIMIT
+		if not perChild then
+			Log.debug(
+				string.format(
+					"%s has %d children; watching at parent level only",
+					Serializer.fullPath(instance),
+					childCount
+				)
+			)
+		end
+
+		local subscription: Subscription = {
+			instance = instance,
+			connections = {},
+			childConnections = {},
+			perChild = perChild,
+		}
+		self.subscriptions[ref] = subscription
+
+		table.insert(
+			subscription.connections,
+			instance.ChildAdded:Connect(function(child)
+				watchChild(self, subscription, child)
+				local ok, node = pcall(Serializer.node, child)
+				if ok then
+					self.emit({
+						type = "childAdded",
+						parent = ref,
+						node = node,
+						index = table.find(instance:GetChildren(), child) or -1,
+					})
+				end
+			end)
+		)
+
+		table.insert(
+			subscription.connections,
+			instance.ChildRemoved:Connect(function(child)
+				disconnectChild(subscription, child)
+				-- Only announce children VS Code has actually seen.
+				local childRef = Registry.existingRef(child)
+				if childRef then
+					Registry.forget(child)
+					self.emit({ type = "childRemoved", parent = ref, ref = childRef })
+				end
+			end)
+		)
+
+		-- The node's own name matters too: it is a row in its parent's list.
+		table.insert(
+			subscription.connections,
+			instance:GetPropertyChangedSignal("Name"):Connect(function()
+				local ok, node = pcall(Serializer.node, instance)
+				if ok then
+					self.emit({ type = "nodeChanged", node = node })
+				end
+			end)
+		)
+
+		for _, child in ipairs(instance:GetChildren()) do
+			watchChild(self, subscription, child)
+		end
+end
+
+function Watcher.unsubscribe(self: Watcher, ref: string)
+		local subscription = self.subscriptions[ref]
+		if not subscription then
+			return
+		end
+		for _, connection in ipairs(subscription.connections) do
+			connection:Disconnect()
+		end
+		for child in pairs(subscription.childConnections) do
+			disconnectChild(subscription, child)
+		end
+		self.subscriptions[ref] = nil
+end
+
+--- Watches a script's Source so an open VS Code editor can refresh itself. Separate
+--- from tree subscriptions: opening a script does not mean its parent is expanded.
+---
+--- Two signals, because neither is sufficient alone. `Source` changing covers edits
+--- made from outside the editor (a plugin, an undo, Script Sync writing a file in),
+--- but lags while the script is open in Studio. TextDocumentDidChange covers the open
+--- case, and fires per keystroke — hence the throttle.
+function Watcher.watchSource(self: Watcher, ref: string, instance: Instance)
+		if self.sourceWatches[ref] then
+			return
+		end
+
+		local connections: { RBXScriptConnection } = {}
+		local lastAnnounced = 0
+
+		local function announce()
+			local now = os.clock()
+			if now - lastAnnounced < SOURCE_THROTTLE then
+				return
+			end
+			lastAnnounced = now
+			self.emit({ type = "sourceChanged", ref = ref })
+		end
+
+		local okSignal, signal = pcall(function()
+			return instance:GetPropertyChangedSignal("Source")
+		end)
+		if okSignal then
+			connections[#connections + 1] = signal:Connect(announce)
+		end
+
+		local okEditor, editorConnection = pcall(function()
+			return game:GetService("ScriptEditorService").TextDocumentDidChange:Connect(function(document)
+				local okScript, scriptRef = pcall(function()
+					return document:GetScript()
+				end)
+				if okScript and scriptRef == instance then
+					announce()
+				end
+			end)
+		end)
+		if okEditor then
+			connections[#connections + 1] = editorConnection
+		end
+
+		if #connections == 0 then
+			return
+		end
+		self.sourceWatches[ref] = connections
+end
+
+function Watcher.unwatchSource(self: Watcher, ref: string)
+		local connections = self.sourceWatches[ref]
+		if connections then
+			for _, connection in ipairs(connections) do
+				connection:Disconnect()
+			end
+			self.sourceWatches[ref] = nil
+		end
+end
+
+--- Applies a selection from VS Code without echoing it back as a selectionChanged
+--- event. The flag is cleared on the next frame because SelectionChanged fires
+--- asynchronously.
+function Watcher.applySelection(self: Watcher, instances: { Instance })
+		local selection = game:GetService("Selection")
+		self.suppressSelectionEcho = true
+		local ok, err = pcall(function()
+			selection:Set(instances)
+		end)
+		task.defer(function()
+			self.suppressSelectionEcho = false
+		end)
+		if not ok then
+			Log.debug("selection failed:", err)
+		end
+end
+
+function Watcher.subscriptionCount(self: Watcher): number
+		local count = 0
+		for _ in pairs(self.subscriptions) do
+			count += 1
+		end
+		return count
+end
+
+function Watcher.destroy(self: Watcher)
+		for ref in pairs(self.subscriptions) do
+			Watcher.unsubscribe(self, ref)
+		end
+		for ref in pairs(self.sourceWatches) do
+			Watcher.unwatchSource(self, ref)
+		end
+		for _, connection in ipairs(self.globalConnections) do
+			connection:Disconnect()
+		end
+		self.globalConnections = {}
+end
+
+return Watcher
+]]></ProtectedString>
+			</Properties>
+		</Item>
+	</Item>
+</roblox>
